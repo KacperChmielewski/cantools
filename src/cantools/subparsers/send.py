@@ -1,16 +1,15 @@
 import argparse
 import re
-import traceback
 from typing import Any
 
 import can.cli
-from argparse_addons import Integer  # type: ignore
 
-from cantools.database import Message, Signal, EncodeError
-from .__utils__ import format_message
+from cantools.database import EncodeError, Message, Signal
+
 from .. import database
 from ..database import Database
 from ..database.namedsignalvalue import NamedSignalValue
+from .__utils__ import format_message
 
 TOLERANCE = 0.10
 
@@ -28,20 +27,17 @@ a = [
 ]
 
 
-def split_name_args(s: str):
+def split_name_args(s: str) -> tuple[str, str]:
     s = s.strip()
-
     m = re.match(r'^([A-Za-z0-9_]+)\s*(?:\((.*)\)|\s+(.*))?$', s)
     if not m:
         return s, ""
-
     name = m.group(1)
     args = m.group(2) if m.group(2) is not None else m.group(3)
-
     return name, (args or "").strip()
 
 
-def normalize_args(arg_str):
+def normalize_args(arg_str: str) -> str:
     # Replace commas with spaces
     arg_str = arg_str.replace(',', ' ')
     # Collapse multiple spaces
@@ -49,7 +45,7 @@ def normalize_args(arg_str):
     return arg_str.strip()
 
 
-def parse_args(arg_str):
+def parse_args(arg_str: str) -> tuple[list[Any], dict[Any, Any]]:
     if not arg_str:
         return [], {}
 
@@ -65,15 +61,14 @@ def parse_args(arg_str):
         if '=' in token:
             key, val = token.split('=', 1)
             named[key] = val
+        # Handle "key = value" split across tokens
+        elif i + 2 < len(tokens) and tokens[i + 1] == '=':
+            key = token
+            val = tokens[i + 2]
+            named[key] = val
+            i += 2
         else:
-            # Handle "key = value" split across tokens
-            if i + 2 < len(tokens) and tokens[i + 1] == '=':
-                key = token
-                val = tokens[i + 2]
-                named[key] = val
-                i += 2
-            else:
-                positional.append(token)
+            positional.append(token)
 
         i += 1
 
@@ -92,9 +87,7 @@ def parse_string(s):
 
 
 def get_string_of_a_signal_desc(signal: Signal) -> str:
-    lines = list()
-    lines.append(f"- {signal.name}:")
-    lines.append(f"   step: {signal.scale}")
+    lines = [f"- {signal.name}:", f"   step: {signal.scale}"]
     if signal.minimum is not None:
         lines.append(f"    min: {signal.minimum}")
     if signal.maximum is not None:
@@ -108,10 +101,8 @@ def get_string_of_a_signal_desc(signal: Signal) -> str:
     return '\n'.join(lines)
 
 
-def get_signal_and_range(msg) -> str:
-    lines = list()
-
-    lines.append(f"{msg.name}[0x{msg.frame_id:x}]")
+def get_signal_and_range(msg: Message) -> str:
+    lines = [f"{msg.name}[0x{msg.frame_id:x}]"]
     for signal in msg.signals:
         lines.append(get_string_of_a_signal_desc(signal))
 
@@ -126,8 +117,8 @@ def string_to_can_frame(dbase: Database, msg_str: str) -> tuple[Message, dict[An
 
     try:
         message_from_db = dbase.get_message_by_name(frame_name)
-    except KeyError as e:
-        print(f"Could not find message: {e}")
+    except KeyError as err:
+        print(f"Could not find message: {err}")
         # invalid frame name. but maybe it's somewhere close?
         message_names = [message.name for message in dbase.messages]
         matching = [s for s in message_names if frame_name in s]
@@ -138,14 +129,19 @@ def string_to_can_frame(dbase: Database, msg_str: str) -> tuple[Message, dict[An
             head_line = "Available frame names:"
             candidates = message_names
         candidates.sort()
-        raise ValueError("Invalid frame name.\n" + head_line + '\n  ' + '\n  '.join(candidates))
+        raise ValueError("Invalid frame name.\n" + head_line + '\n  ' + '\n  '.join(candidates)) from None
 
     if len(positional_args) != 0 and len(named_args) != 0:
         raise ValueError("You cannot use named and positional arguments at the same time")
 
     if len(positional_args) > 0:
         for i in range(len(positional_args)):
-            named_args[message_from_db.signals[i].name] = positional_args[i]
+            try:
+                named_args[message_from_db.signals[i].name] = positional_args[i]
+            except IndexError:
+                raise ValueError(
+                    f"Too much positional arguments! "
+                    f"Got {len(positional_args)}, expected {len(named_args)}.") from None
 
     # resolve choices
     for signal_name, signal_value in named_args.items():
@@ -156,8 +152,9 @@ def string_to_can_frame(dbase: Database, msg_str: str) -> tuple[Message, dict[An
                 signal_value = resolved_value
             try:
                 float(signal_value)
-            except ValueError:
-                raise ValueError(f"Invalid choice value ({signal_value}) for:\n" + get_string_of_a_signal_desc(signal))
+            except ValueError as err:
+                raise ValueError(
+                    f"Invalid choice value ({signal_value}) for:\n" + get_string_of_a_signal_desc(signal)) from err
         named_args[signal_name] = signal_value
 
     # cast values to floats
@@ -165,15 +162,15 @@ def string_to_can_frame(dbase: Database, msg_str: str) -> tuple[Message, dict[An
     return message_from_db, named_args
 
 
-def validate_args_tolerances(params_provided: dict, params_calculated: dict, scales: dict, tolerances):
+def validate_args_tolerances(params_provided: dict, params_calculated: dict, scales: dict, tolerances: dict) -> None:
     # Check same keys first
     if set(params_provided.keys()) != set(params_calculated.keys()):
         raise KeyError("Mismatch in keys")
 
     if isinstance(tolerances, float):
-        tolerances = {key: tolerances for key in scales}
+        tolerances = dict.fromkeys(scales, tolerances)
 
-    for key in params_provided:
+    for key, _ in params_provided.items():
         if key not in params_calculated:
             raise KeyError(f"Missing key in b: {key}")
         value_provided = float(params_provided[key])
@@ -214,9 +211,9 @@ def _do_send(args):
 
     try:
         frame_payload = dbase.encode_message(msg_from_db.frame_id, msg_args_provided, strict=is_strict)
-    except EncodeError as e:
+    except EncodeError as err:
         print(get_signal_and_range(msg_from_db))
-        raise e
+        raise err
 
     msg = can.Message(arbitration_id=msg_from_db.frame_id, data=frame_payload,
                       is_extended_id=msg_from_db.is_extended_frame, is_fd=msg_from_db.is_fd)
